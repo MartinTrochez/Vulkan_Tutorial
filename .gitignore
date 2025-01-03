@@ -1,0 +1,4 @@
+*.json
+./src/1_drawing_a_triangle/*.pdb
+./src/1_drawing_a_triangle/*.rdi
+./src/1_drawing_a_triangle/*.exe
