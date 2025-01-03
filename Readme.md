@@ -2,7 +2,7 @@
 
 Learning using the [vulkan-tutorial](https://vulkan-tutorial.com)
 
-> [!Roadmap]
+> [!NOTE]
 > - [x] Drawing a Triangle
 > - [ ] Vertex Buffers
 > - [ ] Uniform Buffers
