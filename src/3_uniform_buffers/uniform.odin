@@ -1,17 +1,22 @@
-package vertex_buffers
+package uniforms
 
 import "base:runtime"
+import "base:intrinsics"
 import "core:fmt"
 import "core:strings"
-import "core:math"
+import "core:time"
 import "core:mem"
 import glm "core:math/linalg/glsl"
 import "vendor:glfw"
 import vk "vendor:vulkan"
 
-U32_MAX: u32 : 4294967295
-U64_MAX: u64 : 18446744073709551615
+U32_MAX: u32 : 429_4967_295
+U64_MAX: u64 : 18_446_744_073_709_551_615
 MAX_FRAME_IN_FLIGHT :: 2
+
+Vec2f32 :: [2]f32
+Vec3f32 :: [3]f32
+Mat4f32 :: matrix[4, 4]f32
 
 WindowHandle :: glfw.WindowHandle
 
@@ -35,6 +40,9 @@ Renderer :: struct {
 	swap_chain_extent: vk.Extent2D,
 	swap_chain_image_views: [dynamic]vk.ImageView,
 	render_pass: vk.RenderPass,
+	descriptor_set_layout: vk.DescriptorSetLayout,
+	descriptor_pool: vk.DescriptorPool,
+	descriptor_sets: [dynamic]vk.DescriptorSet,
 	pipeline_layout: vk.PipelineLayout,
 	graphics_pipeline: vk.Pipeline,
 	swap_chainbuffers: [dynamic]vk.Framebuffer,
@@ -47,6 +55,9 @@ Renderer :: struct {
 	vertex_buffer_memory: vk.DeviceMemory,
 	index_buffer: vk.Buffer,
 	index_buffer_memory: vk.DeviceMemory,
+	uniform_buffers: [dynamic]vk.Buffer,
+	uniform_buffers_memory: [dynamic]vk.DeviceMemory,
+	uniform_buffers_mapped: [dynamic]rawptr,
 }
 
 Queue_Family_Indices :: struct {
@@ -60,9 +71,20 @@ Swap_Chain_Support_Details :: struct {
 	present_modes: []vk.PresentModeKHR,
 }
 
+Vertex_Attr :: enum {
+	Position,
+	Color,
+}
+
 Vertex :: struct {
-	pos: glm.vec2,
-	color: glm.vec3,
+	pos: Vec2f32,
+	color: Vec3f32,
+}
+
+Uniform_Buffer_Object :: struct {
+	model: Mat4f32,
+	view: Mat4f32,
+	proj: Mat4f32,
 }
 
 validation_layers := []cstring{"VK_LAYER_KHRONOS_validation"}
@@ -100,6 +122,12 @@ indices := []u16 {
 
 vertex_shader_code :: #load("shader.vert.spv")
 fragment_shader_code :: #load("shader.frag.spv")
+
+nanoseconds_to_seconds :: #force_inline proc(
+	value: $T
+) -> T where intrinsics.type_is_numeric(T) {
+	return value / 1_000_000_000
+}
 
 vk_check_result :: proc(result: vk.Result, loc := #caller_location) {
 	assert(result == .SUCCESS, 
@@ -442,7 +470,7 @@ create_swap_chain :: proc() {
 
 	vk_check_result(vk.GetSwapchainImagesKHR(renderer.device, renderer.swap_chain, 
 		                                     &image_count, nil))
-	resize(&renderer.swap_chain_images, image_count)
+	resize_dynamic_array(&renderer.swap_chain_images, image_count)
 	vk_check_result(vk.GetSwapchainImagesKHR(renderer.device, renderer.swap_chain, 
 		                                     &image_count, raw_data(renderer.swap_chain_images)))
 
@@ -519,7 +547,7 @@ choose_swap_surface_format :: proc(available_formats: []vk.SurfaceFormatKHR) -> 
 
 create_image_views :: proc() {
 	size := len(renderer.swap_chain_images)
-	resize(&renderer.swap_chain_image_views, size)
+	resize_dynamic_array(&renderer.swap_chain_image_views, size)
 
 	for i := 0; i < size; i += 1 {
 		create_info := vk.ImageViewCreateInfo {
@@ -593,6 +621,25 @@ create_render_pass :: proc() {
 		                                nil, &renderer.render_pass))
 }
 
+create_descriptor_set_layout :: proc() {
+	ubo_layout_binding := vk.DescriptorSetLayoutBinding {
+		binding = 0,
+		descriptorType = .UNIFORM_BUFFER,
+		descriptorCount = 1,
+		stageFlags = {.VERTEX},
+		pImmutableSamplers = nil,
+	}
+
+	layout_info := vk.DescriptorSetLayoutCreateInfo {
+		sType = .DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+		bindingCount = 1,
+		pBindings = &ubo_layout_binding,
+	}
+
+	vk_check_result(vk.CreateDescriptorSetLayout(renderer.device, &layout_info, 
+		                                         nil, &renderer.descriptor_set_layout))
+}
+
 create_graphics_pipeline :: proc() {
     vert_shader_module := create_shader_module(vertex_shader_code)
     defer vk.DestroyShaderModule(renderer.device, vert_shader_module, nil)
@@ -640,7 +687,7 @@ create_graphics_pipeline :: proc() {
 		vertexBindingDescriptionCount = 1,
 		pVertexBindingDescriptions = &binding_descriptions,
 		vertexAttributeDescriptionCount = u32(len(attribute_descriptions)),
-		pVertexAttributeDescriptions = raw_data(attribute_descriptions[:]),
+		pVertexAttributeDescriptions = raw_data(&attribute_descriptions),
 	}
 
 	input_assembly := vk.PipelineInputAssemblyStateCreateInfo {
@@ -675,7 +722,9 @@ create_graphics_pipeline :: proc() {
 		polygonMode = .FILL,
 		lineWidth = 1.0,
 		cullMode = {.BACK},
-		frontFace = .CLOCKWISE,
+		// NOTE: Before it was .CLOCKWISE, but becuase we flip the Y coordinate
+		// in the update_uniform_buffer procedures, we have to change the drawn order
+		frontFace = .COUNTER_CLOCKWISE, 
 		depthBiasEnable = false,
 		depthBiasConstantFactor = 0.0,
 		depthBiasClamp = 0.0,
@@ -714,10 +763,8 @@ create_graphics_pipeline :: proc() {
 
 	pipeline_layout_info := vk.PipelineLayoutCreateInfo {
 		sType = .PIPELINE_LAYOUT_CREATE_INFO,
-		setLayoutCount = 0,
-		pSetLayouts = nil,
-		pushConstantRangeCount = 0,
-		pPushConstantRanges = nil,
+		setLayoutCount = 1,
+		pSetLayouts = &renderer.descriptor_set_layout,
 	}
 
 	vk_check_result(vk.CreatePipelineLayout(renderer.device, &pipeline_layout_info,
@@ -761,7 +808,7 @@ create_shader_module :: proc(code: []byte) -> vk.ShaderModule {
 
 create_frame_buffers :: proc() {
 	length := len(renderer.swap_chain_image_views)
-	resize(&renderer.swap_chainbuffers, length)
+	resize_dynamic_array(&renderer.swap_chainbuffers, length)
 
 	for i in 0..<length {
 		attachments := []vk.ImageView {
@@ -850,8 +897,78 @@ create_index_buffer :: proc() {
 	vk.FreeMemory(renderer.device, staging_buffer_memory, nil)
 }
 
-create_command_buffer :: proc() {
-	resize(&renderer.command_buffers, MAX_FRAME_IN_FLIGHT)
+create_uniform_buffers :: proc() {
+	buffer_size := vk.DeviceSize(size_of(Uniform_Buffer_Object))
+
+	resize_dynamic_array(&renderer.uniform_buffers, MAX_FRAME_IN_FLIGHT)
+	resize_dynamic_array(&renderer.uniform_buffers_memory, MAX_FRAME_IN_FLIGHT)
+	resize_dynamic_array(&renderer.uniform_buffers_mapped, MAX_FRAME_IN_FLIGHT)
+
+	for i in 0 ..< MAX_FRAME_IN_FLIGHT {
+		create_buffer(buffer_size, {.UNIFORM_BUFFER}, {.HOST_VISIBLE, .HOST_COHERENT}, 
+			          &renderer.uniform_buffers[i], &renderer.uniform_buffers_memory[i])
+		vk_check_result(vk.MapMemory(renderer.device, renderer.uniform_buffers_memory[i], 0, 
+			                         buffer_size, {}, &renderer.uniform_buffers_mapped[i]))
+	}
+}
+
+create_descriptor_pool :: proc() {
+	pool_size := vk.DescriptorPoolSize {
+		type = .UNIFORM_BUFFER,
+		descriptorCount = u32(MAX_FRAME_IN_FLIGHT)
+	}
+
+	pool_info := vk.DescriptorPoolCreateInfo {
+		sType = .DESCRIPTOR_POOL_CREATE_INFO,
+		poolSizeCount = 1,
+		pPoolSizes = &pool_size,
+		maxSets = u32(MAX_FRAME_IN_FLIGHT),
+	}
+
+	vk_check_result(vk.CreateDescriptorPool(renderer.device, &pool_info, nil, &renderer.descriptor_pool))
+}
+
+create_descriptor_sets :: proc() {
+	layout := make_dynamic_array_len([dynamic]vk.DescriptorSetLayout, MAX_FRAME_IN_FLIGHT)
+
+	// Initialize layout with descriptor_set_layout
+	for i in 0 ..< MAX_FRAME_IN_FLIGHT {
+		layout[i] = renderer.descriptor_set_layout
+	}
+
+	alloc_info := vk.DescriptorSetAllocateInfo {
+		sType = .DESCRIPTOR_SET_ALLOCATE_INFO,
+		descriptorPool = renderer.descriptor_pool,
+		descriptorSetCount = u32(MAX_FRAME_IN_FLIGHT),
+		pSetLayouts = raw_data(layout),
+	}
+
+	resize_dynamic_array(&renderer.descriptor_sets, MAX_FRAME_IN_FLIGHT)
+	vk_check_result(vk.AllocateDescriptorSets(renderer.device, &alloc_info, raw_data(renderer.descriptor_sets)))
+
+	for i in 0 ..< MAX_FRAME_IN_FLIGHT {
+		buffer_info := vk.DescriptorBufferInfo {
+			buffer = renderer.uniform_buffers[i],
+			offset = 0,
+			range = size_of(Uniform_Buffer_Object), 
+		}
+
+		descriptor_write := vk.WriteDescriptorSet {
+			sType = .WRITE_DESCRIPTOR_SET,
+			dstSet = renderer.descriptor_sets[i],
+			dstBinding = 0,
+			dstArrayElement = 0,
+			descriptorType = .UNIFORM_BUFFER,
+			descriptorCount = 1,
+			pBufferInfo = &buffer_info,
+		}
+
+        vk.UpdateDescriptorSets(renderer.device, 1, &descriptor_write, 0, nil)
+	}
+}
+
+create_command_buffers :: proc() {
+	resize_dynamic_array(&renderer.command_buffers, MAX_FRAME_IN_FLIGHT)
 
 	alloc_info := vk.CommandBufferAllocateInfo {
 		sType = .COMMAND_BUFFER_ALLOCATE_INFO,
@@ -915,6 +1032,9 @@ record_command_buffer :: proc(command_buffer: vk.CommandBuffer, image_index: u32
 		vk.CmdBindVertexBuffers(command_buffer, 0, 1, raw_data(vertex_buffers), raw_data(offsets))
 		vk.CmdBindIndexBuffer(command_buffer, renderer.index_buffer, 0, .UINT16)
 
+		vk.CmdBindDescriptorSets(command_buffer, .GRAPHICS, renderer.pipeline_layout, 0, 1, 
+			                     &renderer.descriptor_sets[current_frame], 0, nil)
+
 		vk.CmdDrawIndexed(command_buffer, u32(len(indices)), 1, 0, 0, 0)
 	}
 	vk.CmdEndRenderPass(command_buffer)
@@ -923,9 +1043,9 @@ record_command_buffer :: proc(command_buffer: vk.CommandBuffer, image_index: u32
 }
 
 create_sync_objects :: proc() {
-	resize(&renderer.image_available_semaphores, MAX_FRAME_IN_FLIGHT)
-	resize(&renderer.render_finished_semaphores, MAX_FRAME_IN_FLIGHT)
-	resize(&renderer.in_flight_fences, MAX_FRAME_IN_FLIGHT)
+	resize_dynamic_array(&renderer.image_available_semaphores, MAX_FRAME_IN_FLIGHT)
+	resize_dynamic_array(&renderer.render_finished_semaphores, MAX_FRAME_IN_FLIGHT)
+	resize_dynamic_array(&renderer.in_flight_fences, MAX_FRAME_IN_FLIGHT)
 
 	semaphore_info := vk.SemaphoreCreateInfo {
 		sType = .SEMAPHORE_CREATE_INFO,
@@ -955,7 +1075,7 @@ create_buffer :: proc(
 ) {
 	buffer_info := vk.BufferCreateInfo {
 		sType = .BUFFER_CREATE_INFO,
-		size = vk.DeviceSize(size_of(vertices[0]) * len(vertices)),
+		size = size,
 		usage = usage,
 		sharingMode = .EXCLUSIVE,
 	}
@@ -1051,17 +1171,15 @@ get_binding_description :: proc() -> vk.VertexInputBindingDescription {
 	return binding_description
 }
 
-get_attribute_descriptions :: proc() -> [2]vk.VertexInputAttributeDescription {
-	attribute_descriptions := [2]vk.VertexInputAttributeDescription {
-		// Position
-		{
+get_attribute_descriptions :: proc() -> [Vertex_Attr]vk.VertexInputAttributeDescription {
+	attribute_descriptions := [Vertex_Attr]vk.VertexInputAttributeDescription {
+		.Position ={
 			binding = 0,
 			location = 0,
 			format = .R32G32_SFLOAT,
 			offset = u32(offset_of(Vertex, pos)),
 		},
-		// Color 
-		{
+		.Color = {
 			binding = 0,
 			location = 1,
 			format = .R32G32B32_SFLOAT,
@@ -1079,7 +1197,8 @@ find_memory_type :: proc(type_filter: u32, properties: vk.MemoryPropertyFlags) -
 
 	count := mem_properties.memoryTypeCount
 	for i in 0 ..< count  {
-		if (type_filter & (1 << i)) != 0 && (mem_properties.memoryTypes[i].propertyFlags & properties) == properties {
+		if (type_filter & (1 << i)) != 0 && 
+		   (mem_properties.memoryTypes[i].propertyFlags & properties) == properties {
 			return i
 		}
 	}
@@ -1120,6 +1239,8 @@ draw_frame :: proc() {
 
 	vk.ResetCommandBuffer(renderer.command_buffers[current_frame], nil)
 	record_command_buffer(renderer.command_buffers[current_frame], image_index)
+
+	update_uniform_buffer(current_frame)
 
 	submit_info := vk.SubmitInfo {
 		sType = .SUBMIT_INFO,
@@ -1168,8 +1289,45 @@ draw_frame :: proc() {
 	current_frame = (current_frame + 1) % MAX_FRAME_IN_FLIGHT
 }
 
+update_uniform_buffer :: proc(current_image: u32) {
+	@(static)
+	start_time: time.Time
+	if start_time._nsec == 0 {
+		start_time = time.now()
+	}
+
+	current_time := time.now()
+	tick_diff := time.diff(start_time, current_time) 
+
+	time_seconds := nanoseconds_to_seconds(f32(tick_diff))
+
+	aspect_ratio := f32(renderer.swap_chain_extent.width) / f32(renderer.swap_chain_extent.height)
+
+	ubo := Uniform_Buffer_Object {
+		model = glm.mat4Rotate(Vec3f32{0, 0, 1}, time_seconds * glm.radians_f32(90)),
+		view = glm.mat4LookAt(Vec3f32{2, 2, 2}, Vec3f32{0, 0, 0}, Vec3f32{0, 0, 1}),
+		proj = glm.mat4Perspective(glm.radians_f32(45), aspect_ratio,
+		                           0.1, 10.0)
+	}
+
+	// NOTE: We flip the sign in the Y coordinate because glm was designed for OpenGl,
+	// and vulkan this coordinate is inverted
+	ubo.proj[1][1] *= -1
+	{
+		result := mem.copy(renderer.uniform_buffers_mapped[current_image], &ubo, size_of(ubo))
+		assert(result != nil, 
+			   fmt.tprint("Failed to copy the uniform data to the mapped memory\nFile: %v - Line: %v", #file, #line))
+	}
+}
+
 cleanup :: proc() {
 	cleanup_swap_chains()
+	for i in 0 ..< MAX_FRAME_IN_FLIGHT {
+		vk.DestroyBuffer(renderer.device, renderer.uniform_buffers[i], nil)
+		vk.FreeMemory(renderer.device, renderer.uniform_buffers_memory[i], nil)
+	}
+    vk.DestroyDescriptorPool(renderer.device, renderer.descriptor_pool, nil);
+	vk.DestroyDescriptorSetLayout(renderer.device, renderer.descriptor_set_layout, nil)
 	vk.DestroyBuffer(renderer.device, renderer.index_buffer, nil)
 	vk.FreeMemory(renderer.device, renderer.index_buffer_memory, nil)
 	vk.DestroyBuffer(renderer.device, renderer.vertex_buffer, nil)
@@ -1206,12 +1364,16 @@ main :: proc() {
 		create_swap_chain()
 		create_image_views()
 		create_render_pass()
+		create_descriptor_set_layout()
 		create_graphics_pipeline()
 		create_frame_buffers()
 		create_command_pool()
 		create_vertex_buffer()
 		create_index_buffer()
-		create_command_buffer()
+		create_uniform_buffers()
+		create_descriptor_pool()
+		create_descriptor_sets()
+		create_command_buffers()
 		create_sync_objects()
 	}	
 	defer cleanup()
