@@ -4,8 +4,8 @@ Learning using the [vulkan-tutorial](https://vulkan-tutorial.com)
 
 > [!NOTE]
 > - [x] Drawing a Triangle
-> - [ ] Vertex Buffers
-> - [ ] Uniform Buffers
+> - [x] Vertex Buffers
+> - [x] Uniform Buffers
 > - [ ] Texture Mapping
 > - [ ] Depth Buffering
 > - [ ] Loading Models
